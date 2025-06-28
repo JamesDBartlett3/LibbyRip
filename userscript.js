@@ -194,9 +194,16 @@
 
           const link = document.createElement("a");
           link.href = URL.createObjectURL(blob);
-          link.download = `${getAuthorString()} - ${BIF.map.title.main}.${
-            url.index
-          }.mp3`;
+          const bookMetadata = getMetadata();
+          const formattedTitle = formatTitleWithArticle(bookMetadata.title);
+          const titlePart =
+            formattedTitle +
+            (bookMetadata.subtitle ? " - " + bookMetadata.subtitle : "");
+          const authorPart = "[" + getAuthorString() + "]";
+          link.download = `${titlePart} ${authorPart}.${paddy(
+            url.index,
+            3
+          )}.mp3`;
           link.click();
 
           URL.revokeObjectURL(link.href);
@@ -206,6 +213,25 @@
       chapterMenuElem.querySelector("#dumpAll").style.display = "";
     };
   }
+  function formatTitleWithArticle(title) {
+    if (!title) return title;
+
+    // List of articles to move to the end
+    const articles = ["The", "A", "An"];
+
+    for (const article of articles) {
+      if (title.startsWith(article + " ")) {
+        // Remove the article and space from the beginning
+        const titleWithoutArticle = title.substring(article.length + 1);
+        // Add the article to the end with a comma
+        return titleWithoutArticle + ", " + article;
+      }
+    }
+
+    // Return original title if no article found at the beginning
+    return title;
+  }
+
   function getAuthorString() {
     return BIF.map.creator
       .filter((creator) => creator.role === "author")
@@ -217,6 +243,7 @@
     let spineToIndex = BIF.map.spine.map((x) => x["-odread-original-path"]);
     let metadata = {
       title: BIF.map.title.main,
+      subtitle: BIF.map.title.subtitle || "",
       description: BIF.map.description,
       coverUrl: BIF.root.querySelector("image").getAttribute("href"),
       creator: BIF.map.creator,
@@ -420,7 +447,13 @@
     const link = document.createElement("a");
     link.href = blob_url;
 
-    link.download = getAuthorString() + " - " + BIF.map.title.main + ".mp3";
+    const bookMetadata = getMetadata();
+    const formattedTitle = formatTitleWithArticle(bookMetadata.title);
+    const titlePart =
+      formattedTitle +
+      (bookMetadata.subtitle ? " - " + bookMetadata.subtitle : "");
+    const authorPart = "[" + getAuthorString() + "]";
+    link.download = titlePart + " " + authorPart + ".mp3";
     document.body.appendChild(link);
     link.click();
     link.remove();
@@ -528,7 +561,8 @@
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
           downloadState += 1;
         } else if (data.type === "downloadsCompleted") {
-          downloadElem.innerHTML += "<br>All downloads completed! Creating zip file...<br>";
+          downloadElem.innerHTML +=
+            "<br>All downloads completed! Creating zip file...<br>";
           downloadElem.innerHTML += "Zip progress: <b id='zipProg'>0</b>%<br>";
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
         } else if (data.type === "metadataCompleted") {
@@ -551,8 +585,13 @@
 
           const link = document.createElement("a");
           link.href = downloadUrl;
-          link.download =
-            getAuthorString() + " - " + BIF.map.title.main + ".zip";
+          const bookMetadata = getMetadata();
+          const formattedTitle = formatTitleWithArticle(bookMetadata.title);
+          const titlePart =
+            formattedTitle +
+            (bookMetadata.subtitle ? " - " + bookMetadata.subtitle : "");
+          const authorPart = "[" + getAuthorString() + "]";
+          link.download = titlePart + " " + authorPart + ".zip";
           document.body.appendChild(link);
           link.click();
           link.remove();
@@ -1172,7 +1211,13 @@
     const downloadUrl = URL.createObjectURL(zipBlob);
     const link = document.createElement("a");
     link.href = downloadUrl;
-    link.download = BIF.map.title.main + ".epub";
+    const bookMetadata = getMetadata();
+    const formattedTitle = formatTitleWithArticle(bookMetadata.title);
+    const titlePart =
+      formattedTitle +
+      (bookMetadata.subtitle ? " - " + bookMetadata.subtitle : "");
+    const authorPart = "[" + getAuthorString() + "]";
+    link.download = titlePart + " " + authorPart + ".epub";
     link.click();
 
     // Clean up the object URL
