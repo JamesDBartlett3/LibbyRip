@@ -482,8 +482,9 @@
       self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js');
       
       self.onmessage = async function(e) {
-        const { urls, addMeta, metadataInfo } = e.data;
+        const { urls, addMeta, metadataInfo, combinedMp3Info } = e.data;
         const zip = new JSZip();
+        const mp3Buffers = [];
         
         // Fetch all files and add them to the zip
         for (let i = 0; i < urls.length; i++) {
@@ -491,6 +492,10 @@
           const response = await fetch(url.url);
           const blob = await response.blob();
           const filename = "Part " + paddy(url.index + 1, 3) + ".mp3";
+          
+          // Store the MP3 data for concatenation
+          const arrayBuffer = await blob.arrayBuffer();
+          mp3Buffers.push({ index: url.index, buffer: arrayBuffer });
           
           // Report progress back to the main thread
           self.postMessage({ 
@@ -503,6 +508,47 @@
           
           zip.file(filename, blob, { compression: "STORE" });
         }
+        
+        // Sort MP3 buffers by index to ensure correct order
+        mp3Buffers.sort((a, b) => a.index - b.index);
+        
+        // Create combined MP3 using binary concatenation
+        self.postMessage({ type: 'combiningMp3' });
+        
+        // Get cover image for embedding
+        let coverImageData = null;
+        let coverMimeType = null;
+        if (addMeta && metadataInfo.coverUrl) {
+          try {
+            const coverResponse = await fetch(metadataInfo.coverUrl);
+            const coverArrayBuffer = await coverResponse.arrayBuffer();
+            coverImageData = new Uint8Array(coverArrayBuffer);
+            
+            // Determine MIME type from URL
+            const coverUrl = metadataInfo.coverUrl.toLowerCase();
+            if (coverUrl.includes('.jpg') || coverUrl.includes('.jpeg')) {
+              coverMimeType = 'image/jpeg';
+            } else if (coverUrl.includes('.png')) {
+              coverMimeType = 'image/png';
+            } else {
+              coverMimeType = 'image/jpeg'; // Default fallback
+            }
+          } catch (error) {
+            console.warn('Failed to fetch cover image for embedding:', error);
+          }
+        }
+        
+        const combinedMp3 = concatenateMP3s(
+          mp3Buffers.map(item => item.buffer), 
+          metadataInfo, 
+          coverImageData, 
+          coverMimeType
+        );
+        const combinedBlob = new Blob([combinedMp3], { type: 'audio/mpeg' });
+        
+        // Add combined MP3 to zip
+        zip.file(combinedMp3Info.filename, combinedBlob, { compression: "STORE" });
+        self.postMessage({ type: 'combinedMp3Added' });
         
         // Signal that all downloads are complete
         self.postMessage({ type: 'downloadsCompleted' });
@@ -537,6 +583,344 @@
         });
       };
       
+      function concatenateMP3s(mp3ArrayBuffers, metadata, coverImageData, coverMimeType) {
+        if (mp3ArrayBuffers.length === 0) return new ArrayBuffer(0);
+        
+        // Create ID3v2 tag with metadata and cover art
+        const id3Tag = createID3v2Tag(metadata, coverImageData, coverMimeType);
+        
+        // Calculate total size of audio data (skipping ID3 tags from all files)
+        const processedBuffers = mp3ArrayBuffers.map((buffer, index) => {
+          return skipID3v2Tag(buffer);
+        });
+        
+        const audioDataSize = processedBuffers.reduce((sum, buffer) => sum + buffer.byteLength, 0);
+        const totalSize = id3Tag.byteLength + audioDataSize;
+        
+        // Create the combined buffer
+        const combined = new ArrayBuffer(totalSize);
+        const combinedView = new Uint8Array(combined);
+        
+        // Add ID3v2 tag at the beginning
+        let offset = 0;
+        combinedView.set(new Uint8Array(id3Tag), offset);
+        offset += id3Tag.byteLength;
+        
+        // Add all audio data
+        for (const buffer of processedBuffers) {
+          const view = new Uint8Array(buffer);
+          combinedView.set(view, offset);
+          offset += buffer.byteLength;
+        }
+        
+        return combined;
+      }
+      
+      function createID3v2Tag(metadata, coverImageData, coverMimeType) {
+        const frames = [];
+        
+        // Create text frames
+        if (metadata && metadata.title) {
+          frames.push(createTextFrame('TIT2', metadata.title)); // Title
+        }
+        if (metadata && metadata.creator && metadata.creator.length > 0) {
+          const artists = metadata.creator
+            .filter(c => c.role === 'author')
+            .map(c => c.name)
+            .join(', ');
+          if (artists) {
+            frames.push(createTextFrame('TPE1', artists)); // Artist
+            frames.push(createTextFrame('TPE2', artists)); // Album Artist
+          }
+        }
+        if (metadata && metadata.title) {
+          frames.push(createTextFrame('TALB', metadata.title)); // Album
+        }
+        
+        // Add cover art frame if available
+        if (coverImageData && coverMimeType) {
+          frames.push(createAPICFrame(coverImageData, coverMimeType));
+        }
+        
+        // Add chapter frames if available
+        if (metadata && metadata.chapters && metadata.spine) {
+          const chapterFrames = createChapterFrames(metadata.chapters, metadata.spine);
+          frames.push(...chapterFrames);
+        }
+        
+        // Calculate total frames size
+        const framesSize = frames.reduce((sum, frame) => sum + frame.byteLength, 0);
+        const headerSize = 10;
+        const totalTagSize = headerSize + framesSize;
+        
+        // Create ID3v2 header
+        const header = new ArrayBuffer(headerSize);
+        const headerView = new Uint8Array(header);
+        
+        // ID3v2 identifier
+        headerView[0] = 0x49; // 'I'
+        headerView[1] = 0x44; // 'D'
+        headerView[2] = 0x33; // '3'
+        
+        // Version (2.3.0)
+        headerView[3] = 0x03; // Major version
+        headerView[4] = 0x00; // Revision
+        
+        // Flags
+        headerView[5] = 0x00;
+        
+        // Size (synchsafe integer - excluding header)
+        const sizeBytes = encodeSize(framesSize);
+        headerView[6] = sizeBytes[0];
+        headerView[7] = sizeBytes[1];
+        headerView[8] = sizeBytes[2];
+        headerView[9] = sizeBytes[3];
+        
+        // Combine header and frames
+        const tag = new ArrayBuffer(totalTagSize);
+        const tagView = new Uint8Array(tag);
+        
+        tagView.set(new Uint8Array(header), 0);
+        let offset = headerSize;
+        
+        for (const frame of frames) {
+          tagView.set(new Uint8Array(frame), offset);
+          offset += frame.byteLength;
+        }
+        
+        return tag;
+      }
+      
+      function createTextFrame(frameId, text) {
+        const textBytes = new TextEncoder().encode(text);
+        const frameSize = 1 + textBytes.byteLength; // 1 byte for encoding + text
+        const totalSize = 10 + frameSize; // 10 byte header + frame data
+        
+        const frame = new ArrayBuffer(totalSize);
+        const view = new Uint8Array(frame);
+        
+        // Frame header
+        for (let i = 0; i < 4; i++) {
+          view[i] = frameId.charCodeAt(i);
+        }
+        
+        // Size (4 bytes, big-endian)
+        view[4] = (frameSize >>> 24) & 0xFF;
+        view[5] = (frameSize >>> 16) & 0xFF;
+        view[6] = (frameSize >>> 8) & 0xFF;
+        view[7] = frameSize & 0xFF;
+        
+        // Flags (2 bytes)
+        view[8] = 0x00;
+        view[9] = 0x00;
+        
+        // Frame data
+        view[10] = 0x03; // UTF-8 encoding
+        view.set(textBytes, 11);
+        
+        return frame;
+      }
+      
+      function createAPICFrame(imageData, mimeType) {
+        const mimeBytes = new TextEncoder().encode(mimeType);
+        const descBytes = new TextEncoder().encode('Cover'); // Description
+        
+        const frameDataSize = 1 + mimeBytes.byteLength + 1 + 1 + descBytes.byteLength + 1 + imageData.byteLength;
+        const totalSize = 10 + frameDataSize;
+        
+        const frame = new ArrayBuffer(totalSize);
+        const view = new Uint8Array(frame);
+        
+        // Frame header - APIC
+        view[0] = 0x41; // 'A'
+        view[1] = 0x50; // 'P'
+        view[2] = 0x49; // 'I'
+        view[3] = 0x43; // 'C'
+        
+        // Size (4 bytes, big-endian)
+        view[4] = (frameDataSize >>> 24) & 0xFF;
+        view[5] = (frameDataSize >>> 16) & 0xFF;
+        view[6] = (frameDataSize >>> 8) & 0xFF;
+        view[7] = frameDataSize & 0xFF;
+        
+        // Flags (2 bytes)
+        view[8] = 0x00;
+        view[9] = 0x00;
+        
+        // Frame data
+        let offset = 10;
+        
+        // Text encoding (UTF-8)
+        view[offset++] = 0x03;
+        
+        // MIME type
+        view.set(mimeBytes, offset);
+        offset += mimeBytes.byteLength;
+        view[offset++] = 0x00; // Null terminator
+        
+        // Picture type (3 = Cover front)
+        view[offset++] = 0x03;
+        
+        // Description
+        view.set(descBytes, offset);
+        offset += descBytes.byteLength;
+        view[offset++] = 0x00; // Null terminator
+        
+        // Image data
+        view.set(imageData, offset);
+        
+        return frame;
+      }
+      
+      function createChapterFrames(chapters, spine) {
+        const frames = [];
+        
+        // Calculate cumulative spine durations
+        const spineOffsets = [];
+        let cumulativeDuration = 0;
+        for (let i = 0; i < spine.length; i++) {
+          spineOffsets[i] = cumulativeDuration;
+          cumulativeDuration += spine[i].duration;
+        }
+        
+        // Process chapters and create CHAP frames
+        for (let i = 0; i < chapters.length; i++) {
+          const chapter = chapters[i];
+          const nextChapter = chapters[i + 1];
+          
+          // Calculate absolute start time in milliseconds
+          const startTimeMs = Math.round((spineOffsets[chapter.spine] + chapter.offset) * 1000);
+          
+          // Calculate end time
+          let endTimeMs;
+          if (nextChapter) {
+            endTimeMs = Math.round((spineOffsets[nextChapter.spine] + nextChapter.offset) * 1000);
+          } else {
+            // Last chapter ends at the total duration
+            endTimeMs = Math.round(cumulativeDuration * 1000);
+          }
+          
+          // Create chapter ID
+          const chapterId = 'ch' + (i + 1).toString().padStart(3, '0');
+          
+          // Create CHAP frame
+          frames.push(createCHAPFrame(chapterId, startTimeMs, endTimeMs, chapter.title));
+        }
+        
+        return frames;
+      }
+      
+      function createCHAPFrame(chapterId, startTimeMs, endTimeMs, title) {
+        const chapterIdBytes = new TextEncoder().encode(chapterId);
+        
+        // Create TIT2 sub-frame for chapter title
+        const tit2Frame = createTIT2SubFrame(title);
+        
+        // Calculate frame data size
+        const frameDataSize = chapterIdBytes.byteLength + 1 + // Chapter ID + null terminator
+                             4 + 4 + 4 + 4 + // Start/End time + Start/End byte offset
+                             tit2Frame.byteLength; // Sub-frame
+        
+        const totalSize = 10 + frameDataSize; // Header + data
+        
+        const frame = new ArrayBuffer(totalSize);
+        const view = new Uint8Array(frame);
+        
+        // Frame header - CHAP
+        view[0] = 0x43; // 'C'
+        view[1] = 0x48; // 'H'
+        view[2] = 0x41; // 'A'
+        view[3] = 0x50; // 'P'
+        
+        // Size (4 bytes, big-endian)
+        view[4] = (frameDataSize >>> 24) & 0xFF;
+        view[5] = (frameDataSize >>> 16) & 0xFF;
+        view[6] = (frameDataSize >>> 8) & 0xFF;
+        view[7] = frameDataSize & 0xFF;
+        
+        // Flags (2 bytes)
+        view[8] = 0x00;
+        view[9] = 0x00;
+        
+        // Frame data
+        let offset = 10;
+        
+        // Chapter ID
+        view.set(chapterIdBytes, offset);
+        offset += chapterIdBytes.byteLength;
+        view[offset++] = 0x00; // Null terminator
+        
+        // Start time (4 bytes, big-endian, milliseconds)
+        view[offset++] = (startTimeMs >>> 24) & 0xFF;
+        view[offset++] = (startTimeMs >>> 16) & 0xFF;
+        view[offset++] = (startTimeMs >>> 8) & 0xFF;
+        view[offset++] = startTimeMs & 0xFF;
+        
+        // End time (4 bytes, big-endian, milliseconds)
+        view[offset++] = (endTimeMs >>> 24) & 0xFF;
+        view[offset++] = (endTimeMs >>> 16) & 0xFF;
+        view[offset++] = (endTimeMs >>> 8) & 0xFF;
+        view[offset++] = endTimeMs & 0xFF;
+        
+        // Start byte offset (4 bytes, 0xFFFFFFFF = not used)
+        view[offset++] = 0xFF;
+        view[offset++] = 0xFF;
+        view[offset++] = 0xFF;
+        view[offset++] = 0xFF;
+        
+        // End byte offset (4 bytes, 0xFFFFFFFF = not used)
+        view[offset++] = 0xFF;
+        view[offset++] = 0xFF;
+        view[offset++] = 0xFF;
+        view[offset++] = 0xFF;
+        
+        // Sub-frame (TIT2 with chapter title)
+        view.set(new Uint8Array(tit2Frame), offset);
+        
+        return frame;
+      }
+      
+      function createTIT2SubFrame(title) {
+        const titleBytes = new TextEncoder().encode(title);
+        const frameSize = 1 + titleBytes.byteLength; // 1 byte for encoding + text
+        const totalSize = 10 + frameSize; // 10 byte header + frame data
+        
+        const frame = new ArrayBuffer(totalSize);
+        const view = new Uint8Array(frame);
+        
+        // Frame header - TIT2
+        view[0] = 0x54; // 'T'
+        view[1] = 0x49; // 'I'
+        view[2] = 0x54; // 'T'
+        view[3] = 0x32; // '2'
+        
+        // Size (4 bytes, big-endian)
+        view[4] = (frameSize >>> 24) & 0xFF;
+        view[5] = (frameSize >>> 16) & 0xFF;
+        view[6] = (frameSize >>> 8) & 0xFF;
+        view[7] = frameSize & 0xFF;
+        
+        // Flags (2 bytes)
+        view[8] = 0x00;
+        view[9] = 0x00;
+        
+        // Frame data
+        view[10] = 0x03; // UTF-8 encoding
+        view.set(titleBytes, 11);
+        
+        return frame;
+      }
+      
+      function encodeSize(size) {
+        // Encode as synchsafe integer (7 bits per byte)
+        return [
+          (size >>> 21) & 0x7F,
+          (size >>> 14) & 0x7F,
+          (size >>> 7) & 0x7F,
+          size & 0x7F
+        ];
+      }
+      
       function paddy(num, padlen, padchar) {
         var pad_char = typeof padchar !== 'undefined' ? padchar : '0';
         var pad = new Array(1 + padlen).join(pad_char);
@@ -560,6 +944,12 @@
           downloadElem.appendChild(partElem);
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
           downloadState += 1;
+        } else if (data.type === "combiningMp3") {
+          downloadElem.innerHTML += "Combining MP3 files...<br>";
+          downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        } else if (data.type === "combinedMp3Added") {
+          downloadElem.innerHTML += "Combined MP3 added to zip<br>";
+          downloadElem.scrollTo(0, downloadElem.scrollHeight);
         } else if (data.type === "downloadsCompleted") {
           downloadElem.innerHTML +=
             "<br>All downloads completed! Creating zip file...<br>";
@@ -615,10 +1005,19 @@
       downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
       // Start the worker
+      const bookMetadata = getMetadata();
+      const formattedTitle = formatTitleWithArticle(bookMetadata.title);
+      const titlePart =
+        formattedTitle +
+        (bookMetadata.subtitle ? " - " + bookMetadata.subtitle : "");
+      const authorPart = "[" + getAuthorString() + "]";
+      const combinedMp3Filename = titlePart + " " + authorPart + ".mp3";
+
       worker.postMessage({
         urls: urls,
         addMeta: addMeta,
-        metadataInfo: addMeta ? getMetadata() : null,
+        metadataInfo: addMeta ? bookMetadata : null,
+        combinedMp3Info: { filename: combinedMp3Filename },
       });
     });
   }
