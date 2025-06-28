@@ -16,6 +16,13 @@
 // @grant         none
 // ==/UserScript==
 
+/*
+DEV NOTES:
+----------
+- None of the metadata embedding functionality is working. Explore using lamejs or ffmpeg.wasm to embed metadata in the mp3 files.
+- The zip file creation is extremely slow. Consider replacing JSZip with https://github.com/101arrowz/fflate.
+*/
+
 (() => {
   // Since the ffmpeg.js file is 50mb, it slows the page down too much
   // to be in a "require" attribute, so we load it in async
