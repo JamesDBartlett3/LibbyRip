@@ -623,6 +623,30 @@ DEV NOTES:
         return combined;
       }
       
+      function skipID3v2Tag(arrayBuffer) {
+        const view = new Uint8Array(arrayBuffer);
+        
+        // Check for ID3v2 tag (starts with "ID3")
+        if (view.length >= 10 && 
+            view[0] === 0x49 && view[1] === 0x44 && view[2] === 0x33) {
+          
+          // Parse ID3v2 tag size (synchsafe integer in bytes 6-9)
+          const size = ((view[6] & 0x7F) << 21) |
+                      ((view[7] & 0x7F) << 14) |
+                      ((view[8] & 0x7F) << 7) |
+                      (view[9] & 0x7F);
+          
+          // Skip the 10-byte header + tag size
+          const skipBytes = 10 + size;
+          if (skipBytes < view.length) {
+            return arrayBuffer.slice(skipBytes);
+          }
+        }
+        
+        // No ID3v2 tag found or tag is malformed, return original buffer
+        return arrayBuffer;
+      }
+      
       function createID3v2Tag(metadata, coverImageData, coverMimeType) {
         const frames = [];
         
