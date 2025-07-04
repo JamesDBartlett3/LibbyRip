@@ -516,6 +516,9 @@ DEV NOTES:
           zip.file(filename, blob, { compression: "STORE" });
         }
         
+        // Signal that ALL individual downloads are complete before moving on
+        self.postMessage({ type: 'downloadsCompleted' });
+        
         // Sort MP3 buffers by index to ensure correct order
         mp3Buffers.sort((a, b) => a.index - b.index);
         
@@ -556,9 +559,6 @@ DEV NOTES:
         // Add combined MP3 to zip
         zip.file(combinedMp3Info.filename, combinedBlob, { compression: "STORE" });
         self.postMessage({ type: 'combinedMp3Added' });
-        
-        // Signal that all downloads are complete
-        self.postMessage({ type: 'downloadsCompleted' });
         
         if (addMeta) {
           // Handle metadata in the worker
@@ -975,15 +975,15 @@ DEV NOTES:
           downloadElem.appendChild(partElem);
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
           downloadState += 1;
+        } else if (data.type === "downloadsCompleted") {
+          downloadElem.innerHTML += "<br>All downloads completed!<br>";
+          downloadElem.scrollTo(0, downloadElem.scrollHeight);
         } else if (data.type === "combiningMp3") {
           downloadElem.innerHTML += "Combining MP3 files...<br>";
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
         } else if (data.type === "combinedMp3Added") {
           downloadElem.innerHTML += "Combined MP3 added to zip<br>";
-          downloadElem.scrollTo(0, downloadElem.scrollHeight);
-        } else if (data.type === "downloadsCompleted") {
-          downloadElem.innerHTML +=
-            "<br>All downloads completed! Creating zip file...<br>";
+          downloadElem.innerHTML += "<br>Creating zip file...<br>";
           downloadElem.innerHTML += "Zip progress: <b id='zipProg'>0</b>%<br>";
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
         } else if (data.type === "metadataCompleted") {
