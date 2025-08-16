@@ -492,56 +492,165 @@ DEV NOTES:
         const { urls, addMeta, metadataInfo } = e.data;
         const zip = new JSZip();
         
-        // Fetch all files and add them to the zip
-        for (let i = 0; i < urls.length; i++) {
-          const url = urls[i];
-          const response = await fetch(url.url);
-          const blob = await response.blob();
-          const filename = "Part " + paddy(url.index + 1, 3) + ".mp3";
+        // Performance optimizations for large books
+        const BATCH_SIZE = 5; // Process downloads in batches to prevent memory overload
+        const YIELD_INTERVAL = 10; // Yield to main thread every 10 operations
+        const MAX_CONCURRENT_FETCHES = 3; // Limit concurrent network requests
+        
+        // Helper function to yield control back to the event loop
+        function yieldToMainThread() {
+          return new Promise(resolve => setTimeout(resolve, 0));
+        }
+        
+        // Adaptive batch size based on book size
+        const adaptiveBatchSize = urls.length > 50 ? 3 : 
+                                 urls.length > 20 ? 4 : BATCH_SIZE;
+        
+        self.postMessage({
+          type: 'info',
+          message: 'Processing ' + urls.length + ' files in batches of ' + adaptiveBatchSize
+        });
+        
+        // Process downloads in batches to manage memory better
+        for (let batchStart = 0; batchStart < urls.length; batchStart += adaptiveBatchSize) {
+          const batchEnd = Math.min(batchStart + adaptiveBatchSize, urls.length);
+          const batch = urls.slice(batchStart, batchEnd);
           
-          // Report progress back to the main thread
-          self.postMessage({ 
-            type: 'progress', 
-            index: url.index,
-            filename: filename,
-            completed: i + 1,
-            total: urls.length
+          // Send heartbeat for large batches
+          self.postMessage({
+            type: 'heartbeat',
+            message: 'Processing batch ' + Math.floor(batchStart / adaptiveBatchSize + 1) + ' of ' + Math.ceil(urls.length / adaptiveBatchSize)
           });
           
-          zip.file(filename, blob, { compression: "STORE" });
+          // Process current batch with concurrency limit
+          const batchPromises = batch.map(async (url, batchIndex) => {
+            try {
+              const response = await fetch(url.url);
+              if (!response.ok) {
+                throw new Error('HTTP ' + response.status + ': ' + response.statusText);
+              }
+              
+              const blob = await response.blob();
+              const filename = "Part " + paddy(url.index + 1, 3) + ".mp3";
+              
+              // Add to zip immediately to avoid holding all blobs in memory
+              zip.file(filename, blob, { compression: "STORE" });
+              
+              // Report progress back to the main thread
+              self.postMessage({ 
+                type: 'progress', 
+                index: url.index,
+                filename: filename,
+                completed: batchStart + batchIndex + 1,
+                total: urls.length
+              });
+              
+              // Yield periodically to prevent blocking
+              if ((batchStart + batchIndex) % YIELD_INTERVAL === 0) {
+                await yieldToMainThread();
+              }
+              
+            } catch (error) {
+              console.error('Failed to download ' + url.url + ':', error);
+              self.postMessage({
+                type: 'error',
+                message: 'Failed to download part ' + (url.index + 1) + ': ' + error.message
+              });
+              throw error;
+            }
+          });
+          
+          // Wait for current batch to complete before starting next batch
+          await Promise.all(batchPromises);
+          
+          // Yield between batches to prevent worker freezing
+          await yieldToMainThread();
         }
         
         // Signal that ALL individual downloads are complete before moving on
         self.postMessage({ type: 'downloadsCompleted' });
         
         if (addMeta) {
-          // Handle metadata in the worker
-          const folder = zip.folder("metadata");
-          
-          // Cover image
-          const coverResponse = await fetch(metadataInfo.coverUrl);
-          const coverBlob = await coverResponse.blob();
-          const csplit = metadataInfo.coverUrl.split(".");
-          folder.file("cover." + csplit[csplit.length-1], coverBlob, { compression: "STORE" });
-          
-          // Metadata JSON
-          folder.file("metadata.json", JSON.stringify(metadataInfo, null, 2));
-          
-          self.postMessage({ type: 'metadataCompleted' });
+          try {
+            // Handle metadata in the worker with error handling
+            const folder = zip.folder("metadata");
+            
+            // Cover image with timeout and error handling
+            const coverResponse = await Promise.race([
+              fetch(metadataInfo.coverUrl),
+              new Promise((_, reject) => 
+                setTimeout(() => reject(new Error('Cover fetch timeout')), 30000)
+              )
+            ]);
+            
+            if (coverResponse.ok) {
+              const coverBlob = await coverResponse.blob();
+              const csplit = metadataInfo.coverUrl.split(".");
+              folder.file("cover." + csplit[csplit.length-1], coverBlob, { compression: "STORE" });
+            }
+            
+            // Metadata JSON - keep it lightweight
+            const lightweightMetadata = {
+              title: metadataInfo.title,
+              subtitle: metadataInfo.subtitle,
+              creator: metadataInfo.creator,
+              publisher: metadataInfo.publisher,
+              publishedDate: metadataInfo.publishedDate,
+              description: metadataInfo.description,
+              // Only include essential chapter info to reduce size
+              chapters: metadataInfo.chapters ? metadataInfo.chapters.map(ch => ({
+                title: ch.title,
+                spine: ch.spine,
+                offset: ch.offset
+              })) : [],
+              spine: metadataInfo.spine
+            };
+            
+            folder.file("metadata.json", JSON.stringify(lightweightMetadata, null, 2));
+            
+            self.postMessage({ type: 'metadataCompleted' });
+            
+            // Yield after metadata processing
+            await yieldToMainThread();
+            
+          } catch (error) {
+            console.warn('Failed to process metadata:', error);
+            self.postMessage({
+              type: 'warning',
+              message: 'Failed to add metadata to zip, continuing without it.'
+            });
+          }
         }
         
-        // Generate the zip file with progress reporting
-        zip.generateAsync({
-          type: 'blob',
-          compression: "STORE",
-          streamFiles: true,
-        }, (meta) => {
-          if (meta.percent) {
-            self.postMessage({ type: 'zipProgress', percent: meta.percent });
-          }
-        }).then(blob => {
+        // Generate the zip file with enhanced progress reporting and memory management
+        try {
+          const zipOptions = {
+            type: 'blob',
+            compression: "STORE", // No compression for better performance
+            streamFiles: true,    // Stream files to manage memory
+            compressionOptions: {
+              level: 0            // Fastest compression (no compression)
+            }
+          };
+          
+          const blob = await zip.generateAsync(zipOptions, (meta) => {
+            if (meta.percent) {
+              // Throttle progress updates to prevent overwhelming the main thread
+              if (meta.percent % 5 < 0.1 || meta.percent > 99) {
+                self.postMessage({ type: 'zipProgress', percent: meta.percent });
+              }
+            }
+          });
+          
           self.postMessage({ type: 'complete', blob: blob });
-        });
+          
+        } catch (error) {
+          console.error('Zip generation failed:', error);
+          self.postMessage({
+            type: 'error',
+            message: 'Failed to generate zip file: ' + error.message
+          });
+        }
       };
       
       function createID3v2Tag(metadata, coverImageData, coverMimeType) {
@@ -885,6 +994,38 @@ DEV NOTES:
             downloadElem.querySelector("#zipProg").textContent =
               data.percent.toFixed(2);
           }
+        } else if (data.type === "error") {
+          downloadElem.innerHTML +=
+            "<span style='color: red;'>Error: " + data.message + "</span><br>";
+          downloadElem.scrollTo(0, downloadElem.scrollHeight);
+
+          // Stop the process and clean up
+          downloadState = -1;
+          downloadElem.classList.remove("active");
+          URL.revokeObjectURL(workerUrl);
+          worker.terminate();
+        } else if (data.type === "warning") {
+          downloadElem.innerHTML +=
+            "<span style='color: orange;'>Warning: " +
+            data.message +
+            "</span><br>";
+          downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        } else if (data.type === "info") {
+          downloadElem.innerHTML +=
+            "<span style='color: blue;'>Info: " + data.message + "</span><br>";
+          downloadElem.scrollTo(0, downloadElem.scrollHeight);
+        } else if (data.type === "heartbeat") {
+          // Update a status indicator to show the worker is alive
+          let heartbeatElem = downloadElem.querySelector("#heartbeat");
+          if (!heartbeatElem) {
+            heartbeatElem = document.createElement("div");
+            heartbeatElem.id = "heartbeat";
+            heartbeatElem.style.color = "gray";
+            heartbeatElem.style.fontStyle = "italic";
+            downloadElem.appendChild(heartbeatElem);
+          }
+          heartbeatElem.textContent = data.message;
+          downloadElem.scrollTo(0, downloadElem.scrollHeight);
         } else if (data.type === "complete") {
           downloadElem.innerHTML += "Generated zip file! <br>";
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
@@ -933,6 +1074,12 @@ DEV NOTES:
         formattedTitle +
         (bookMetadata.subtitle ? " - " + bookMetadata.subtitle : "");
       const authorPart = "[" + getAuthorString() + "]";
+
+      // Add message for user about performance optimizations for large books
+      downloadElem.innerHTML +=
+        "<br><b>Performance optimizations active!</b> Downloads are processed in batches to prevent freezing with large books.<br>";
+      downloadElem.innerHTML += "Book size: " + urls.length + " parts<br>";
+      downloadElem.scrollTo(0, downloadElem.scrollHeight);
 
       worker.postMessage({
         urls: urls,
