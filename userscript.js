@@ -489,9 +489,8 @@ DEV NOTES:
       self.importScripts('https://cdnjs.cloudflare.com/ajax/libs/jszip/3.7.1/jszip.min.js');
       
       self.onmessage = async function(e) {
-        const { urls, addMeta, metadataInfo, combinedMp3Info } = e.data;
+        const { urls, addMeta, metadataInfo } = e.data;
         const zip = new JSZip();
-        const mp3Buffers = [];
         
         // Fetch all files and add them to the zip
         for (let i = 0; i < urls.length; i++) {
@@ -499,10 +498,6 @@ DEV NOTES:
           const response = await fetch(url.url);
           const blob = await response.blob();
           const filename = "Part " + paddy(url.index + 1, 3) + ".mp3";
-          
-          // Store the MP3 data for concatenation
-          const arrayBuffer = await blob.arrayBuffer();
-          mp3Buffers.push({ index: url.index, buffer: arrayBuffer });
           
           // Report progress back to the main thread
           self.postMessage({ 
@@ -518,47 +513,6 @@ DEV NOTES:
         
         // Signal that ALL individual downloads are complete before moving on
         self.postMessage({ type: 'downloadsCompleted' });
-        
-        // Sort MP3 buffers by index to ensure correct order
-        mp3Buffers.sort((a, b) => a.index - b.index);
-        
-        // Create combined MP3 using binary concatenation
-        self.postMessage({ type: 'combiningMp3' });
-        
-        // Get cover image for embedding
-        let coverImageData = null;
-        let coverMimeType = null;
-        if (addMeta && metadataInfo.coverUrl) {
-          try {
-            const coverResponse = await fetch(metadataInfo.coverUrl);
-            const coverArrayBuffer = await coverResponse.arrayBuffer();
-            coverImageData = new Uint8Array(coverArrayBuffer);
-            
-            // Determine MIME type from URL
-            const coverUrl = metadataInfo.coverUrl.toLowerCase();
-            if (coverUrl.includes('.jpg') || coverUrl.includes('.jpeg')) {
-              coverMimeType = 'image/jpeg';
-            } else if (coverUrl.includes('.png')) {
-              coverMimeType = 'image/png';
-            } else {
-              coverMimeType = 'image/jpeg'; // Default fallback
-            }
-          } catch (error) {
-            console.warn('Failed to fetch cover image for embedding:', error);
-          }
-        }
-        
-        const combinedMp3 = concatenateMP3s(
-          mp3Buffers.map(item => item.buffer), 
-          metadataInfo, 
-          coverImageData, 
-          coverMimeType
-        );
-        const combinedBlob = new Blob([combinedMp3], { type: 'audio/mpeg' });
-        
-        // Add combined MP3 to zip
-        zip.file(combinedMp3Info.filename, combinedBlob, { compression: "STORE" });
-        self.postMessage({ type: 'combinedMp3Added' });
         
         if (addMeta) {
           // Handle metadata in the worker
@@ -589,63 +543,6 @@ DEV NOTES:
           self.postMessage({ type: 'complete', blob: blob });
         });
       };
-      
-      function concatenateMP3s(mp3ArrayBuffers, metadata, coverImageData, coverMimeType) {
-        if (mp3ArrayBuffers.length === 0) return new ArrayBuffer(0);
-        
-        // Create ID3v2 tag with metadata and cover art
-        const id3Tag = createID3v2Tag(metadata, coverImageData, coverMimeType);
-        
-        // Calculate total size of audio data (skipping ID3 tags from all files)
-        const processedBuffers = mp3ArrayBuffers.map((buffer, index) => {
-          return skipID3v2Tag(buffer);
-        });
-        
-        const audioDataSize = processedBuffers.reduce((sum, buffer) => sum + buffer.byteLength, 0);
-        const totalSize = id3Tag.byteLength + audioDataSize;
-        
-        // Create the combined buffer
-        const combined = new ArrayBuffer(totalSize);
-        const combinedView = new Uint8Array(combined);
-        
-        // Add ID3v2 tag at the beginning
-        let offset = 0;
-        combinedView.set(new Uint8Array(id3Tag), offset);
-        offset += id3Tag.byteLength;
-        
-        // Add all audio data
-        for (const buffer of processedBuffers) {
-          const view = new Uint8Array(buffer);
-          combinedView.set(view, offset);
-          offset += buffer.byteLength;
-        }
-        
-        return combined;
-      }
-      
-      function skipID3v2Tag(arrayBuffer) {
-        const view = new Uint8Array(arrayBuffer);
-        
-        // Check for ID3v2 tag (starts with "ID3")
-        if (view.length >= 10 && 
-            view[0] === 0x49 && view[1] === 0x44 && view[2] === 0x33) {
-          
-          // Parse ID3v2 tag size (synchsafe integer in bytes 6-9)
-          const size = ((view[6] & 0x7F) << 21) |
-                      ((view[7] & 0x7F) << 14) |
-                      ((view[8] & 0x7F) << 7) |
-                      (view[9] & 0x7F);
-          
-          // Skip the 10-byte header + tag size
-          const skipBytes = 10 + size;
-          if (skipBytes < view.length) {
-            return arrayBuffer.slice(skipBytes);
-          }
-        }
-        
-        // No ID3v2 tag found or tag is malformed, return original buffer
-        return arrayBuffer;
-      }
       
       function createID3v2Tag(metadata, coverImageData, coverMimeType) {
         const frames = [];
@@ -977,12 +874,6 @@ DEV NOTES:
           downloadState += 1;
         } else if (data.type === "downloadsCompleted") {
           downloadElem.innerHTML += "<br>All downloads completed!<br>";
-          downloadElem.scrollTo(0, downloadElem.scrollHeight);
-        } else if (data.type === "combiningMp3") {
-          downloadElem.innerHTML += "Combining MP3 files...<br>";
-          downloadElem.scrollTo(0, downloadElem.scrollHeight);
-        } else if (data.type === "combinedMp3Added") {
-          downloadElem.innerHTML += "Combined MP3 added to zip<br>";
           downloadElem.innerHTML += "<br>Creating zip file...<br>";
           downloadElem.innerHTML += "Zip progress: <b id='zipProg'>0</b>%<br>";
           downloadElem.scrollTo(0, downloadElem.scrollHeight);
@@ -1042,13 +933,11 @@ DEV NOTES:
         formattedTitle +
         (bookMetadata.subtitle ? " - " + bookMetadata.subtitle : "");
       const authorPart = "[" + getAuthorString() + "]";
-      const combinedMp3Filename = titlePart + " " + authorPart + ".mp3";
 
       worker.postMessage({
         urls: urls,
         addMeta: addMeta,
         metadataInfo: addMeta ? bookMetadata : null,
-        combinedMp3Info: { filename: combinedMp3Filename },
       });
     });
   }
